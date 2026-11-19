@@ -1,4 +1,5 @@
 
+.pretrained_assets/
 *.pyc
 catpred/uncertainty/__pycache__/uncertainty_predictor.cpython-312.pyc
 catpred/uncertainty/__pycache__/uncertainty_evaluator.cpython-312.pyc
