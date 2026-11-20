@@ -285,8 +285,15 @@ def _expand_deduplicated_prediction_output(
     )
     expanded_df = full_df.merge(prediction_lookup, on=key_columns, how="left", sort=False)
 
-    if expanded_df[prediction_columns].isnull().any().any():
-        raise ValueError("Failed to expand deduplicated predictions to all input rows.")
+    missing_prediction_mask = expanded_df[prediction_columns].isnull().any(axis=1)
+    if missing_prediction_mask.any():
+        missing_rows = full_df.loc[missing_prediction_mask, key_columns].head(3)
+        missing_examples = missing_rows.to_dict(orient="records")
+        raise ValueError(
+            "Failed to expand deduplicated predictions to all input rows. "
+            f"Missing predictions for {int(missing_prediction_mask.sum())} rows; "
+            f"examples={missing_examples}"
+        )
 
     expanded_df.to_csv(original_paths.output_csv, index=False)
 
@@ -542,7 +549,13 @@ def run_inprocess_prediction_pipeline(
         prediction_paths, was_deduplicated = _deduplicate_prediction_input(paths)
     run_inprocess_prediction(request, prediction_paths)
     if was_deduplicated:
-        _expand_deduplicated_prediction_output(paths, prediction_paths)
+        try:
+            _expand_deduplicated_prediction_output(paths, prediction_paths)
+        except ValueError as exc:
+            if "Failed to expand deduplicated predictions to all input rows." not in str(exc):
+                raise
+            # Fallback to full input inference for robustness when dedup expansion mismatches.
+            run_inprocess_prediction(request, paths)
     final_output = _write_postprocessed_predictions(parameter, paths, request.repo_root, results_dir)
     _prediction_cache_put(cache_key, Path(final_output).read_text(encoding="utf-8"))
     return final_output
