@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import contextlib
+import io
+import os
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
+from rdkit import Chem
 
 from VmaxBuilder.database_retrieval.classes.kcat import (
     CATPRED_KCAT_CACHE_NAMESPACE,
@@ -26,6 +30,8 @@ _CACHE_VALUE_COLUMNS = [
     "SD_epistemic",
     "SD_aleatoric",
 ]
+
+_DEFAULT_PENDING_CHUNK_SIZE = 2000
 
 
 @dataclass(frozen=True)
@@ -68,6 +74,21 @@ def _normalise_output_columns(prediction_df: pd.DataFrame) -> pd.DataFrame:
         normalized_df[column] = pd.to_numeric(normalized_df[column], errors="coerce").fillna(0.0)
 
     return normalized_df
+
+
+def _normalise_kcat_smiles_for_cache(smiles: str) -> str:
+    raw_smiles = str(smiles).strip()
+    if raw_smiles == "":
+        return raw_smiles
+
+    mol = Chem.MolFromSmiles(raw_smiles)
+    if mol is None:
+        return raw_smiles
+
+    canonical = Chem.MolToSmiles(mol)
+    if "." in canonical:
+        canonical = ".".join(sorted(canonical.split(".")))
+    return canonical
 
 
 def _cache_key_for_row(
@@ -170,6 +191,20 @@ def _inferred_predictions_to_cache_updates(
     return updates
 
 
+def _resolve_pending_chunk_size() -> int:
+    raw_value = os.getenv("CATPRED_INFERENCE_CHUNK_SIZE", str(_DEFAULT_PENDING_CHUNK_SIZE))
+    try:
+        parsed = int(raw_value)
+    except ValueError:
+        parsed = _DEFAULT_PENDING_CHUNK_SIZE
+    return max(1, parsed)
+
+
+def _iter_pending_chunks(df: pd.DataFrame, chunk_size: int):
+    for start in range(0, len(df), chunk_size):
+        yield df.iloc[start : start + chunk_size].copy()
+
+
 def infer_kcats(
     input_df: pd.DataFrame,
     checkpoint_dir: str,
@@ -178,6 +213,7 @@ def infer_kcats(
     repo_root: str | Path | None = None,
     use_gpu: bool = False,
     cache_file: str | Path | None = None,
+    print_level: int = 0,
 ) -> KcatInferenceResult:
     missing_columns = _REQUIRED_INPUT_COLUMNS.difference(input_df.columns)
     if missing_columns:
@@ -197,6 +233,9 @@ def infer_kcats(
 
     prepared_input_df = input_df[["SMILES", "sequence", "pdbpath"]].copy()
     prepared_input_df["SMILES"] = prepared_input_df["SMILES"].astype(str)
+    prepared_input_df["SMILES"] = prepared_input_df["SMILES"].map(
+        _normalise_kcat_smiles_for_cache
+    )
     prepared_input_df["sequence"] = prepared_input_df["sequence"].astype(str)
     prepared_input_df["pdbpath"] = prepared_input_df["pdbpath"].astype(str)
 
@@ -235,6 +274,28 @@ def infer_kcats(
             cache.invalidate_many(keys_to_invalidate)
 
         ids_to_lookup = [key for key in deduped_lookup_keys if key not in valid_payload]
+        missing_key_set = set(ids_to_lookup)
+
+        if int(print_level) >= 1:
+            unique_total = len(deduped_lookup_keys)
+            unique_cached = len(valid_payload)
+            unique_missing = len(ids_to_lookup)
+            row_level_cached_hits = sum(1 for key in lookup_keys if key not in missing_key_set)
+            print(
+                "[CatPred][Cache] Found "
+                f"{unique_cached}/{unique_total} unique prediction keys in cache: "
+                f"{unique_cached} successful, 0 not found, "
+                f"{len(keys_to_invalidate)} with other errors."
+            )
+            print(
+                "[CatPred][Cache] Row-level hit estimate: "
+                f"{row_level_cached_hits}/{len(lookup_keys)} rows already cached."
+            )
+            if unique_missing == 0:
+                print(
+                    "[CatPred][Cache] All unique sequence+SMILES keys found in cache. "
+                    "No new inference required."
+                )
 
         cached_map: dict[str, CatPredKcatPrediction] = {}
         for key, value in valid_payload.items():
@@ -244,7 +305,6 @@ def infer_kcats(
             if parsed is not None:
                 cached_map[key] = parsed
 
-        missing_key_set = set(ids_to_lookup)
         pending_df = prepared_input_df.loc[
             [key in missing_key_set for key in lookup_keys],
             ["SMILES", "sequence", "pdbpath"],
@@ -261,49 +321,101 @@ def infer_kcats(
             columns=["SMILES", "sequence", "pdbpath", "Prediction_log10", "SD_total", "SD_epistemic", "SD_aleatoric"]
         )
         if not pending_df.empty:
-            pending_input_path = results_path / "kcat_pending_input.csv"
-            pending_df.to_csv(pending_input_path, index=False)
+            pending_chunk_size = _resolve_pending_chunk_size()
+            total_chunks = (len(pending_df) + pending_chunk_size - 1) // pending_chunk_size
+            inferred_chunks: list[pd.DataFrame] = []
+            backend_log_buffer = io.StringIO()
 
-            request = PredictionRequest(
-                parameter="kcat",
-                input_file=str(pending_input_path),
-                checkpoint_dir=str(checkpoint_dir),
-                use_gpu=bool(use_gpu),
-                repo_root=None if repo_root is None else str(repo_root),
-            )
-            output_path = run_inprocess_prediction_pipeline(
-                request=request,
-                results_dir=str(results_path),
-            )
-            raw_output_df = pd.read_csv(output_path)
-            normalized_output_df = _normalise_output_columns(raw_output_df)
+            if int(print_level) >= 1:
+                print(
+                    "[CatPred][Inference] Starting pending inference: "
+                    f"rows={len(pending_df)}, chunks={total_chunks}, "
+                    f"chunk_size={pending_chunk_size}"
+                )
 
-            inferred_df = pending_df.merge(
-                normalized_output_df[
-                    [
-                        "pdbpath",
-                        "Prediction_log10",
-                        "SD_total",
-                        "SD_epistemic",
-                        "SD_aleatoric",
-                    ]
-                ],
-                on="pdbpath",
-                how="left",
-            )
+            for chunk_index, pending_chunk_df in enumerate(
+                _iter_pending_chunks(pending_df, pending_chunk_size),
+                start=1,
+            ):
+                if int(print_level) >= 1:
+                    start_row = (chunk_index - 1) * pending_chunk_size + 1
+                    end_row = min(chunk_index * pending_chunk_size, len(pending_df))
+                    print(
+                        "[CatPred][Inference] Chunk "
+                        f"{chunk_index}/{total_chunks} (rows {start_row}-{end_row})"
+                    )
 
-            for column in _CACHE_VALUE_COLUMNS:
-                inferred_df[column] = pd.to_numeric(
-                    inferred_df[column], errors="coerce"
-                ).fillna(0.0)
+                pending_input_path = (
+                    results_path / f"kcat_pending_input_chunk_{chunk_index:05d}.csv"
+                )
+                pending_chunk_df.to_csv(pending_input_path, index=False)
 
-            cache_updates = _inferred_predictions_to_cache_updates(
-                inferred_df=inferred_df,
-                checkpoint_dir=str(checkpoint_dir),
-                use_gpu=bool(use_gpu),
-            )
-            if cache_updates:
-                cache.set_many(cache_updates)
+                request = PredictionRequest(
+                    parameter="kcat",
+                    input_file=str(pending_input_path),
+                    checkpoint_dir=str(checkpoint_dir),
+                    use_gpu=bool(use_gpu),
+                    repo_root=None if repo_root is None else str(repo_root),
+                )
+                if int(print_level) >= 3:
+                    output_path = run_inprocess_prediction_pipeline(
+                        request=request,
+                        results_dir=str(results_path),
+                    )
+                else:
+                    with (
+                        contextlib.redirect_stdout(backend_log_buffer),
+                        contextlib.redirect_stderr(backend_log_buffer),
+                    ):
+                        output_path = run_inprocess_prediction_pipeline(
+                            request=request,
+                            results_dir=str(results_path),
+                        )
+                raw_output_df = pd.read_csv(output_path)
+                normalized_output_df = _normalise_output_columns(raw_output_df)
+
+                inferred_chunk_df = pending_chunk_df.merge(
+                    normalized_output_df[
+                        [
+                            "pdbpath",
+                            "Prediction_log10",
+                            "SD_total",
+                            "SD_epistemic",
+                            "SD_aleatoric",
+                        ]
+                    ],
+                    on="pdbpath",
+                    how="left",
+                )
+
+                for column in _CACHE_VALUE_COLUMNS:
+                    inferred_chunk_df[column] = pd.to_numeric(
+                        inferred_chunk_df[column], errors="coerce"
+                    ).fillna(0.0)
+
+                cache_updates = _inferred_predictions_to_cache_updates(
+                    inferred_df=inferred_chunk_df,
+                    checkpoint_dir=str(checkpoint_dir),
+                    use_gpu=bool(use_gpu),
+                )
+                if cache_updates:
+                    cache.set_many(cache_updates)
+
+                inferred_chunks.append(inferred_chunk_df)
+
+            if inferred_chunks:
+                inferred_df = pd.concat(inferred_chunks, axis=0, ignore_index=True)
+
+            if int(print_level) >= 1:
+                print(
+                    "[CatPred][Inference] Completed pending inference: "
+                    f"rows={len(inferred_df)}"
+                )
+
+            if int(print_level) >= 1 and backend_log_buffer.getvalue().strip():
+                debug_log_path = results_path / "catpred_inference_debug.log"
+                debug_log_path.write_text(backend_log_buffer.getvalue(), encoding="utf-8")
+                print(f"[CatPred][Inference] Backend logs captured to: {debug_log_path}")
 
         if inferred_df.empty:
             combined_df = cached_df.copy()
@@ -315,9 +427,8 @@ def infer_kcats(
         cache.close()
 
     if not pending_df.empty:
-        pending_input_path = results_path / "kcat_pending_input.csv"
-        if pending_input_path.exists():
-            pending_input_path.unlink(missing_ok=True)
+        for chunk_file in results_path.glob("kcat_pending_input_chunk_*.csv"):
+            chunk_file.unlink(missing_ok=True)
 
     merged_df = prepared_input_df.merge(
         combined_df[
