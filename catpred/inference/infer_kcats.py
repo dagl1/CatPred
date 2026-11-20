@@ -41,6 +41,10 @@ class KcatInferenceResult:
     newly_inferred_count: int
     cached_count: int
 
+def _to_float(val: object) -> float:
+    if isinstance(val, (int, float, str)) and not isinstance(val, bool):
+        return float(val)
+    raise TypeError(f"Expected numeric value, got {type(val).__name__}")
 
 def _normalise_output_columns(prediction_df: pd.DataFrame) -> pd.DataFrame:
     normalized_df = prediction_df.copy()
@@ -172,16 +176,21 @@ def _inferred_predictions_to_cache_updates(
             checkpoint_dir=checkpoint_dir,
             use_gpu=use_gpu,
         )
+        prediction_log10 = _to_float(row.Prediction_log10)
+        sd_total = _to_float(row.SD_total)
+        sd_epistemic = _to_float(row.SD_epistemic)
+        sd_aleatoric = _to_float(row.SD_aleatoric)
+        
         prediction = CatPredKcatPrediction(
             smiles=str(row.SMILES),
             sequence=str(row.sequence),
             pdbpath=str(row.pdbpath),
             checkpoint_dir=str(checkpoint_dir),
             use_gpu=bool(use_gpu),
-            prediction_log10=float(row.Prediction_log10),
-            sd_total=float(row.SD_total),
-            sd_epistemic=float(row.SD_epistemic),
-            sd_aleatoric=float(row.SD_aleatoric),
+            prediction_log10=prediction_log10,
+            sd_total=sd_total,
+            sd_epistemic=sd_epistemic,
+            sd_aleatoric=sd_aleatoric,
             error=None,
             cache_schema_version=KCAT_NAMESPACE_TO_SCHEMA_VERSION[
                 CATPRED_KCAT_CACHE_NAMESPACE
