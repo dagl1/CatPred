@@ -200,12 +200,15 @@ def _inferred_predictions_to_cache_updates(
     return updates
 
 
-def _resolve_pending_chunk_size() -> int:
-    raw_value = os.getenv("CATPRED_INFERENCE_CHUNK_SIZE", str(_DEFAULT_PENDING_CHUNK_SIZE))
-    try:
-        parsed = int(raw_value)
-    except ValueError:
-        parsed = _DEFAULT_PENDING_CHUNK_SIZE
+def _resolve_pending_chunk_size(configured_chunk_size: int | None = None) -> int:
+    if configured_chunk_size is None:
+        raw_value = os.getenv("CATPRED_INFERENCE_CHUNK_SIZE", str(_DEFAULT_PENDING_CHUNK_SIZE))
+        try:
+            parsed = int(raw_value)
+        except ValueError:
+            parsed = _DEFAULT_PENDING_CHUNK_SIZE
+    else:
+        parsed = int(configured_chunk_size)
     return max(1, parsed)
 
 
@@ -221,6 +224,7 @@ def infer_kcats(
     results_dir: str | Path = "../results",
     repo_root: str | Path | None = None,
     use_gpu: bool = False,
+    pending_chunk_size: int | None = None,
     cache_file: str | Path | None = None,
     print_level: int = 0,
 ) -> KcatInferenceResult:
@@ -330,8 +334,8 @@ def infer_kcats(
             columns=["SMILES", "sequence", "pdbpath", "Prediction_log10", "SD_total", "SD_epistemic", "SD_aleatoric"]
         )
         if not pending_df.empty:
-            pending_chunk_size = _resolve_pending_chunk_size()
-            total_chunks = (len(pending_df) + pending_chunk_size - 1) // pending_chunk_size
+            resolved_pending_chunk_size = _resolve_pending_chunk_size(pending_chunk_size)
+            total_chunks = (len(pending_df) + resolved_pending_chunk_size - 1) // resolved_pending_chunk_size
             inferred_chunks: list[pd.DataFrame] = []
             backend_log_buffer = io.StringIO()
 
@@ -339,16 +343,16 @@ def infer_kcats(
                 print(
                     "[CatPred][Inference] Starting pending inference: "
                     f"rows={len(pending_df)}, chunks={total_chunks}, "
-                    f"chunk_size={pending_chunk_size}"
+                    f"chunk_size={resolved_pending_chunk_size}"
                 )
 
             for chunk_index, pending_chunk_df in enumerate(
-                _iter_pending_chunks(pending_df, pending_chunk_size),
+                _iter_pending_chunks(pending_df, resolved_pending_chunk_size),
                 start=1,
             ):
                 if int(print_level) >= 1:
-                    start_row = (chunk_index - 1) * pending_chunk_size + 1
-                    end_row = min(chunk_index * pending_chunk_size, len(pending_df))
+                    start_row = (chunk_index - 1) * resolved_pending_chunk_size + 1
+                    end_row = min(chunk_index * resolved_pending_chunk_size, len(pending_df))
                     print(
                         "[CatPred][Inference] Chunk "
                         f"{chunk_index}/{total_chunks} (rows {start_row}-{end_row})"
